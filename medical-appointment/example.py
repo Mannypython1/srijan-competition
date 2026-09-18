@@ -1,22 +1,93 @@
-"""The baseline. This is the file to replace.
+"""Transcribe the conversation locally, then answer every question against it.
 
-It answers ``True`` to everything and points at nothing, which scores the floor
-and nothing more. It is here to prove the plumbing — that the audio arrives
-intact and that your server speaks the protocol — not to compete.
+Two stages, run once per request and shared across all ten questions:
 
-Note how weak that floor now is. Answering yes to everything still gets half
-the questions right, but it finds none of the evidence, and evidence is the
-larger half of the score. The sketch under the dummy model shows where a real
-system goes.
+1. ``transcribe`` — local ASR (faster-whisper) turns the audio into timestamped
+   segments. This is the expensive half and the only one that scales with
+   audio length.
+2. ``answer_questions`` (in ``answering.py``) — decides each question against
+   the transcript and, for every "yes", which segments it was read from. See
+   that module's docstring for why it is rule-based rather than another model
+   call: the dataset's hard negatives are near-misses on a checkable detail
+   (a dose, a duration, a word), not on topic, so verifying the transcript's
+   own words gets further than judging semantic similarity would.
+
+Nothing here calls a cloud API. Both the ASR model and the answering logic run
+on this machine, as the competition rules require.
 """
 
 import logging
-from typing import Optional, Tuple
+import os
+import tempfile
+import time
+from typing import Dict, List
 
 from dtos import ASRQuestionRequestDto, ASRQuestionResponseDto
-from utils import Span, audio_duration_seconds, decode_audio
+from utils import audio_duration_seconds, decode_audio
+from answering import answer_questions
 
 logger = logging.getLogger(__name__)
+
+# CPU-safe by default; override for the hardware you actually deploy on.
+# A GPU box can go much bigger (e.g. WHISPER_MODEL=large-v3,
+# WHISPER_DEVICE=cuda, WHISPER_COMPUTE_TYPE=float16) and get both better
+# accuracy and tighter evidence out of the same 60-second budget.
+WHISPER_MODEL_NAME = os.environ.get('WHISPER_MODEL', 'small.en')
+WHISPER_DEVICE = os.environ.get('WHISPER_DEVICE', 'auto')
+WHISPER_COMPUTE_TYPE = os.environ.get('WHISPER_COMPUTE_TYPE', 'int8')
+WHISPER_BEAM_SIZE = int(os.environ.get('WHISPER_BEAM_SIZE', '1'))
+
+_model = None
+
+
+def _get_model():
+    """Load the ASR model once and keep it. Called eagerly at import time
+    (see the bottom of this file) so the first real request is not the one
+    that pays for it — there is no warm-up grace period in the timing rules.
+    """
+    global _model
+
+    if _model is None:
+        from faster_whisper import WhisperModel
+
+        logger.info(
+            'Loading Whisper model %r (device=%s, compute_type=%s)',
+            WHISPER_MODEL_NAME, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE,
+        )
+        _model = WhisperModel(
+            WHISPER_MODEL_NAME,
+            device=WHISPER_DEVICE,
+            compute_type=WHISPER_COMPUTE_TYPE,
+        )
+
+    return _model
+
+
+def transcribe(audio_bytes: bytes) -> List[Dict]:
+    """The conversation as timestamped segments: ``[{'start', 'end', 'text'}, ...]``.
+
+    Segment-level timing (rather than joining everything into one string) is
+    what lets a "yes" answer carry real evidence — see the README's "Keep the
+    timings" section.
+    """
+    model = _get_model()
+
+    with tempfile.NamedTemporaryFile(suffix='.mp3') as f:
+        f.write(audio_bytes)
+        f.flush()
+
+        segments, _info = model.transcribe(
+            f.name,
+            language='en',
+            beam_size=WHISPER_BEAM_SIZE,
+            vad_filter=True,
+        )
+
+        return [
+            {'start': segment.start, 'end': segment.end, 'text': segment.text.strip()}
+            for segment in segments
+            if segment.text and segment.text.strip()
+        ]
 
 
 ### CALL YOUR CUSTOM MODEL VIA THIS FUNCTION ###
@@ -28,6 +99,7 @@ def predict(request: ASRQuestionRequestDto) -> ASRQuestionResponseDto:
     expensive half — transcription — is paid once here and shared by every
     answer below.
     """
+    started = time.time()
     audio_bytes = decode_audio(request.audio_base64)
 
     duration = audio_duration_seconds(audio_bytes)
@@ -39,26 +111,34 @@ def predict(request: ASRQuestionRequestDto) -> ASRQuestionResponseDto:
         len(request.questions),
     )
 
-    # Never let this raise. An exception means no response, and no response
-    # means every question about this conversation is scored wrong — ten marks,
-    # not one. A guess is worth half a mark on average; an error is worth
-    # nothing.
-    answers = []
-    evidence_start = []
-    evidence_end = []
+    # Never let either stage raise. An exception means no response, and no
+    # response means every question about this conversation is scored wrong —
+    # ten marks, not one. Falling back to "no evidence found" for every
+    # question is worth half a mark on average; an error is worth nothing.
+    try:
+        segments = transcribe(audio_bytes)
+    except Exception:
+        logger.exception('Transcription failed for %s; answering blind.',
+                          request.audio_filename)
+        segments = []
 
-    for question in request.questions:
-        try:
-            answer, span = answer_question(
-                audio_bytes, request.audio_filename, question
-            )
-        except Exception:
-            logger.exception('Falling back to a guess for: %s', question)
-            answer, span = True, None
+    try:
+        results = answer_questions(segments, request.questions)
+    except Exception:
+        logger.exception('Answering failed for %s; guessing.',
+                          request.audio_filename)
+        results = [(False, None) for _ in request.questions]
 
-        answers.append(answer)
-        evidence_start.append(span[0] if span is not None else None)
-        evidence_end.append(span[1] if span is not None else None)
+    answers, evidence_start, evidence_end = [], [], []
+    for answer, span in results:
+        answers.append(bool(answer))
+        evidence_start.append(float(span[0]) if span is not None else None)
+        evidence_end.append(float(span[1]) if span is not None else None)
+
+    logger.info(
+        '%s: answered %d questions in %.1f s',
+        request.audio_filename, len(request.questions), time.time() - started,
+    )
 
     return ASRQuestionResponseDto(
         answers=answers,
@@ -67,57 +147,12 @@ def predict(request: ASRQuestionRequestDto) -> ASRQuestionResponseDto:
     )
 
 
-### DUMMY MODEL ###
-
-def answer_question(
-    audio_bytes: bytes,
-    audio_filename: str,
-    question: str,
-) -> Tuple[bool, Optional[Span]]:
-    """Always says yes, and never says where.
-
-    Both splits are exactly balanced between yes and no, so the answer half of
-    this scores 0.500: every ``positive`` question right, every
-    ``hard_negative`` and ``off_topic`` question wrong. The evidence half scores
-    0.000, because ``None`` means "nothing to point at" and every annotated yes
-    question is therefore missed. Run ``local_evaluator.py`` and read the
-    per-type breakdown and the evidence block — that shape is the problem you
-    are solving.
-
-    Replace this. The shape of a real answer is roughly:
-
-        def predict(request):
-            # The expensive half, paid once per request rather than once per
-            # question. Ten questions share this transcript.
-            segments = transcribe(decode_audio(request.audio_base64))
-
-            answers, starts, ends = [], [], []
-
-            for question in request.questions:
-                answer, span = answer_from_transcript(segments, question)
-                answers.append(answer)
-                starts.append(span[0] if span else None)
-                ends.append(span[1] if span else None)
-
-            return ASRQuestionResponseDto(
-                answers=answers, evidence_start=starts, evidence_end=ends,
-            )
-
-    where ``transcribe`` is a local ASR model **that returns timestamps** — the
-    span you send back is the start and end of the segment you read the answer
-    off, so word- or segment-level timing is not an optional extra here. Both
-    halves must run without calling a cloud API; see the Rules section of the
-    README.
-
-    Two things to watch while you work:
-
-    Return the passage, not the clip. A span covering the whole conversation
-    overlaps every annotation and scores a temporal IoU near zero against all
-    of them.
-
-    Watch the ``hard_negative`` questions. They are near-misses on dose, drug
-    and entity — "0.15 mg" against a transcript that says "0.3 mg" — so
-    anything that answers from topical overlap alone stays at the floor no
-    matter how good the transcript is.
-    """
-    return True, None
+# Loaded once, at import time, so the first request does not pay for it — see
+# the README's note that there is no separate warm-up period.
+try:
+    _get_model()
+except Exception:
+    logger.exception(
+        'Could not preload the Whisper model at import time; the first '
+        'request will try again and may be slow.'
+    )

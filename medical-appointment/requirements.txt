@@ -8,3 +8,12 @@ pydantic>=2.7,<3          # [2.12.5]
 
 # Only needed by local_evaluator.py.
 requests>=2.31            # [2.32.5]
+
+# Local ASR (example.py). CPU-only by default; ctranslate2 will use a GPU
+# automatically if one is available and CUDA is installed.
+faster-whisper>=1.0       # [1.2.1]
+
+# The answering half (answering.py): TF-IDF retrieval plus rule-based
+# numeric/categorical verification. No model weights to download for this
+# part, only numpy/scipy under the hood.
+scikit-learn>=1.3         # [1.9.1]
